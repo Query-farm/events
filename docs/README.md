@@ -151,6 +151,8 @@ SELECT * FROM my_table;  -- Event sent to handler
 
 ## Fun: Nyan Cat Query Music
 
+![Nyan Cat](https://upload.wikimedia.org/wikipedia/en/e/ed/Nyan_cat_250px_frame.PNG)
+
 Want to hear the [Nyan Cat](https://dn720700.ca.archive.org/0/items/NyanCatoriginal/Nyan%20Cat%20%5Boriginal%5D.mp3) theme while your queries run? Download [play-query-song.py](https://gist.github.com/rustyconover/4f9178c386c240c5cd37aa1306432591) - it plays music when a query starts and stops when it completes. Works on macOS, Linux, and Windows.
 
 ```bash
