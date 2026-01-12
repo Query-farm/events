@@ -1,0 +1,353 @@
+# name: test/sql/events.test
+# description: test events extension
+# group: [events]
+
+require events
+
+require json
+
+# Test default settings using duckdb_settings() for GLOBAL-scoped settings
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'events_destination';
+----
+NULL
+
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'events_async';
+----
+false
+
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'events_types';
+----
+[query_begin, query_end]
+
+# Test setting events_destination
+statement ok
+SET events_destination = '/tmp/test_event_writer.py';
+
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'events_destination';
+----
+/tmp/test_event_writer.py
+
+# Test setting events_async
+statement ok
+SET events_async = true;
+
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'events_async';
+----
+true
+
+# Reset async for subsequent tests
+statement ok
+SET events_async = false;
+
+# Test setting events_types
+statement ok
+SET events_types = ['query_begin', 'query_end', 'transaction_begin'];
+
+# Test events_types with all event types
+statement ok
+SET events_types = ['connection_opened', 'connection_closed', 'query_begin', 'query_end', 'transaction_begin', 'transaction_commit', 'transaction_rollback'];
+
+# Reset settings
+statement ok
+RESET events_types;
+
+statement ok
+SET events_destination = '';
+
+# ============================================================================
+# Event capture and validation tests
+# ============================================================================
+
+# Set up event capture using inline Python to append events
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test1.jsonl';
+
+# Generate a simple query event
+statement ok
+SELECT 42 as test_value;
+
+# Disable events before reading results
+statement ok
+SET events_destination = '';
+
+# Validate query_begin event - all common fields present with correct types
+query IIIIII
+SELECT
+    event,
+    -- Timestamp should be ISO 8601 format ending in Z
+    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp_format,
+    -- database_path should be :memory: or a path
+    database_path IS NOT NULL as has_database_path,
+    -- connection_id should be positive integer
+    connection_id >= 0 as valid_connection_id,
+    -- process_id should be positive integer
+    process_id > 0 as valid_process_id,
+    -- query_id should be positive
+    query_id > 0 as valid_query_id
+FROM read_json_auto('__TEST_DIR__/events_test1.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'query_begin'
+LIMIT 1;
+----
+query_begin	true	true	true	true	true
+
+# Validate query_end event - has_error field and successful completion
+query IIIIII
+SELECT
+    event,
+    -- has_error should be boolean false for successful query
+    has_error = false as no_error,
+    -- query_id should match begin event
+    query_id > 0 as valid_query_id,
+    -- Verify common fields still present
+    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp,
+    connection_id >= 0 as valid_connection_id,
+    process_id > 0 as valid_process_id
+FROM read_json_auto('__TEST_DIR__/events_test1.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'query_end'
+LIMIT 1;
+----
+query_end	true	true	true	true	true
+
+# ============================================================================
+# Test query_id correlation between query_begin and query_end
+# ============================================================================
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test2.jsonl';
+
+statement ok
+SELECT 'correlation_test' as marker;
+
+statement ok
+SET events_destination = '';
+
+# Verify query_begin and query_end have matching query_ids
+query I
+WITH events AS (
+    SELECT * FROM read_json_auto('__TEST_DIR__/events_test2.jsonl', format='newline_delimited', ignore_errors=true)
+),
+begins AS (SELECT query_id FROM events WHERE event = 'query_begin'),
+ends AS (SELECT query_id FROM events WHERE event = 'query_end')
+SELECT COUNT(*) > 0 as has_matching_ids
+FROM begins b
+JOIN ends e ON b.query_id = e.query_id;
+----
+true
+
+# ============================================================================
+# Test attached_databases field
+# ============================================================================
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test3.jsonl';
+
+statement ok
+SELECT 'attached_test' as marker;
+
+statement ok
+SET events_destination = '';
+
+# Verify attached_databases array structure and content
+query IIII
+SELECT
+    len(attached_databases) >= 2 as has_databases,
+    -- Check that memory database is present
+    list_contains(list_transform(attached_databases, x -> x.name), 'memory') as has_memory_db,
+    -- Check that temp database is present
+    list_contains(list_transform(attached_databases, x -> x.name), 'temp') as has_temp_db,
+    -- Verify first database entry has all expected fields (name, path, type, read_only, temporary)
+    attached_databases[1].name IS NOT NULL
+    AND attached_databases[1].type IS NOT NULL
+    AND attached_databases[1].read_only IS NOT NULL
+    AND attached_databases[1].temporary IS NOT NULL as first_db_has_fields
+FROM read_json_auto('__TEST_DIR__/events_test3.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'query_begin'
+LIMIT 1;
+----
+true	true	true	true
+
+# ============================================================================
+# Test events_types filtering
+# ============================================================================
+
+# Only capture query_begin events
+statement ok
+SET events_types = ['query_begin'];
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test4.jsonl';
+
+statement ok
+SELECT 'filter_test' as marker;
+
+statement ok
+SET events_destination = '';
+
+statement ok
+RESET events_types;
+
+# Should only have query_begin events, no query_end
+# (2 events: SELECT 'filter_test' and SET events_destination = '')
+query II
+SELECT
+    COUNT(*) FILTER (WHERE event = 'query_begin') as begin_count,
+    COUNT(*) FILTER (WHERE event = 'query_end') as end_count
+FROM read_json_auto('__TEST_DIR__/events_test4.jsonl', format='newline_delimited', ignore_errors=true);
+----
+2	0
+
+# ============================================================================
+# Test error events
+# ============================================================================
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test5.jsonl';
+
+# This should fail and generate an error event
+statement error
+SELECT * FROM nonexistent_table_xyz;
+----
+Catalog Error: Table with name nonexistent_table_xyz does not exist!
+
+statement ok
+SET events_destination = '';
+
+# Verify error event has correct error information
+query IIIII
+SELECT
+    has_error,
+    -- Error message should contain the table name
+    error_message LIKE '%nonexistent_table_xyz%' as error_mentions_table,
+    -- Error type should be Catalog error
+    error_type = 'Catalog' as correct_error_type,
+    -- Common fields should still be present
+    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp,
+    query_id > 0 as valid_query_id
+FROM read_json_auto('__TEST_DIR__/events_test5.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'query_end' AND has_error = true
+LIMIT 1;
+----
+true	true	true	true	true
+
+# ============================================================================
+# Test transaction events
+# ============================================================================
+
+statement ok
+SET events_types = ['transaction_begin', 'transaction_commit', 'query_begin', 'query_end'];
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test6.jsonl';
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+SELECT 'in_transaction' as marker;
+
+statement ok
+COMMIT;
+
+statement ok
+SET events_destination = '';
+
+statement ok
+RESET events_types;
+
+# Verify transaction events were captured with correct structure
+# (2 of each: explicit BEGIN/COMMIT plus SET events_destination='' auto-transaction)
+query II
+SELECT
+    COUNT(*) FILTER (WHERE event = 'transaction_begin') as begin_count,
+    COUNT(*) FILTER (WHERE event = 'transaction_commit') as commit_count
+FROM read_json_auto('__TEST_DIR__/events_test6.jsonl', format='newline_delimited', ignore_errors=true);
+----
+2	2
+
+# Verify transaction_begin has required fields
+query IIII
+SELECT
+    -- transaction_id should be positive
+    transaction_id > 0 as valid_transaction_id,
+    -- start_timestamp should be present (transaction epoch)
+    start_timestamp IS NOT NULL as has_start_timestamp,
+    -- is_read_only should be boolean
+    is_read_only IS NOT NULL as has_is_read_only,
+    -- Common fields present
+    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp
+FROM read_json_auto('__TEST_DIR__/events_test6.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'transaction_begin'
+LIMIT 1;
+----
+true	true	true	true
+
+# Verify transaction_commit has same transaction fields
+query III
+SELECT
+    transaction_id > 0 as valid_transaction_id,
+    start_timestamp IS NOT NULL as has_start_timestamp,
+    is_read_only IS NOT NULL as has_is_read_only
+FROM read_json_auto('__TEST_DIR__/events_test6.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'transaction_commit'
+LIMIT 1;
+----
+true	true	true
+
+# ============================================================================
+# Test transaction_id in query events
+# ============================================================================
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test7.jsonl';
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+SELECT 'txn_id_test' as marker;
+
+statement ok
+COMMIT;
+
+statement ok
+SET events_destination = '';
+
+# Verify query events within transaction have non-zero transaction_id
+query I
+SELECT transaction_id > 0 as has_txn_id
+FROM read_json_auto('__TEST_DIR__/events_test7.jsonl', format='newline_delimited', ignore_errors=true)
+WHERE event = 'query_begin'
+LIMIT 1;
+----
+true
+
+# ============================================================================
+# Test empty destination disables events
+# ============================================================================
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/events_test8.jsonl';
+
+statement ok
+SELECT 'before_empty' as marker;
+
+statement ok
+SET events_destination = '';
+
+statement ok
+SELECT 'after_empty' as marker;
+
+statement ok
+SELECT 'still_empty' as marker;
+
+# Should only have events from before setting to empty (not from after_empty or still_empty)
+query I
+SELECT COUNT(*) <= 6 as limited_events
+FROM read_json_auto('__TEST_DIR__/events_test8.jsonl', format='newline_delimited', ignore_errors=true);
+----
+true
