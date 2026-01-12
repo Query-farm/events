@@ -13,9 +13,9 @@ INSTALL events FROM community;
 LOAD events;
 ```
 
-## What is Event Streaming?
+## How It Works
 
-Event streaming captures database activities in real-time and sends them to external systems for processing. This enables:
+The extension captures database activities in real-time and delivers them to external programs for processing. This enables:
 
 - **Audit logging**: Track who ran what queries and when
 - **Monitoring**: Watch for errors, slow queries, or suspicious activity
@@ -148,6 +148,26 @@ if event.get('has_error'):
 SET events_destination = '/path/to/handler.py';
 SELECT * FROM my_table;  -- Event sent to handler
 ```
+
+## Fun: Nyan Cat Query Music
+
+Want to hear the [Nyan Cat](https://dn720700.ca.archive.org/0/items/NyanCatoriginal/Nyan%20Cat%20%5Boriginal%5D.mp3) theme while your queries run? Download [play-query-song.py](https://gist.github.com/rustyconover/4f9178c386c240c5cd37aa1306432591) - it plays music when a query starts and stops when it completes. Works on macOS, Linux, and Windows.
+
+```bash
+curl -o play-query-song.py https://gist.githubusercontent.com/rustyconover/4f9178c386c240c5cd37aa1306432591/raw/play-query-song.py
+chmod +x play-query-song.py
+```
+
+```sql
+LOAD events;
+SET events_destination = '/path/to/play-query-song.py';
+SET events_types = ['query_begin', 'query_end'];
+
+-- Enjoy the music while this runs
+SELECT count(*) FROM range(50000000);
+```
+
+The script automatically downloads the audio file on first use.
 
 ## Credits
 
