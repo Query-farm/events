@@ -88,6 +88,7 @@ SELECT * FROM large_table;
 | `events_destination` | VARCHAR | (none) | Path to program that receives events via stdin |
 | `events_async` | BOOLEAN | false | Fire-and-forget delivery (doesn't wait for handler) |
 | `events_types` | LIST | ['query_begin', 'query_end'] | Which event types to capture |
+| `events_session_name` | VARCHAR | '' | Optional name for this session, included in all events |
 
 ### Available Event Types
 
@@ -110,6 +111,7 @@ All events are JSON objects with common fields:
   "event": "query_end",
   "timestamp": "2026-01-12T15:30:45.123Z",
   "database_path": "/data/analytics.duckdb",
+  "session_name": "my-session",
   "connection_id": 1,
   "process_id": 12345,
   "query_id": 42,

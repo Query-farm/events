@@ -39,6 +39,7 @@ The extension registers hooks into DuckDB's `ClientContextState` system to inter
 | `events_destination` | VARCHAR | NULL | Path to the external program that receives events |
 | `events_async` | BOOLEAN | false | If true, events are delivered asynchronously (fire and forget) |
 | `events_types` | LIST(VARCHAR) | `['query_begin', 'query_end']` | List of event types to send |
+| `events_session_name` | VARCHAR | '' | Optional name for this session, included in all events |
 
 ### Usage
 
@@ -51,6 +52,9 @@ SET events_async = true;
 
 -- Optional: customize which events to receive
 SET events_types = ['query_begin', 'query_end', 'transaction_commit'];
+
+-- Optional: name this session for easier identification
+SET events_session_name = 'analytics-pipeline';
 ```
 
 ## Event Types
@@ -82,6 +86,7 @@ All events include these common fields:
   "event": "query_begin",
   "timestamp": "2026-01-12T15:30:45.123Z",
   "database_path": "/path/to/db.duckdb",
+  "session_name": "my-session",
   "connection_id": 1,
   "process_id": 12345
 }
@@ -89,6 +94,7 @@ All events include these common fields:
 
 - `timestamp`: ISO 8601 format with milliseconds
 - `database_path`: File path or `:memory:` for in-memory databases
+- `session_name`: User-defined session name (empty string if not set)
 - `connection_id`: DuckDB's internal connection identifier
 - `process_id`: OS process ID of the DuckDB process
 

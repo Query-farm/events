@@ -40,6 +40,7 @@ namespace duckdb {
 static const string EVENTS_DESTINATION_KEY = "events_destination";
 static const string EVENTS_ASYNC_KEY = "events_async";
 static const string EVENTS_TYPES_KEY = "events_types";
+static const string EVENTS_SESSION_NAME_KEY = "events_session_name";
 
 // Get the events destination from context
 static Value GetEventsDestination(ClientContext &context) {
@@ -56,6 +57,16 @@ static bool GetEventsAsync(ClientContext &context) {
 		return false; // Default to synchronous
 	}
 	return async_value.GetValue<bool>();
+}
+
+// Get the session name from context (default: empty string)
+static string GetEventsSessionName(ClientContext &context) {
+	Value session_name;
+	context.TryGetCurrentSetting(EVENTS_SESSION_NAME_KEY, session_name);
+	if (session_name.IsNull()) {
+		return "";
+	}
+	return session_name.GetValue<string>();
 }
 
 // Check if an event type is enabled
@@ -317,6 +328,7 @@ static uint64_t GetProcessId() {
 static void AddCommonFields(yyjson_mut_doc *doc, yyjson_mut_val *root, ClientContext &context) {
 	yyjson_mut_obj_add_strcpy(doc, root, "timestamp", GetCurrentTimestamp().c_str());
 	yyjson_mut_obj_add_strcpy(doc, root, "database_path", GetDatabasePath(context).c_str());
+	yyjson_mut_obj_add_strcpy(doc, root, "session_name", GetEventsSessionName(context).c_str());
 	yyjson_mut_obj_add_uint(doc, root, "connection_id", context.GetConnectionId());
 	yyjson_mut_obj_add_uint(doc, root, "process_id", GetProcessId());
 }
@@ -602,6 +614,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "query_begin, query_end, transaction_begin, transaction_commit, transaction_rollback, "
 	                          "planning_error, finalize_prepare, execute_prepared, rebind_prepared_statement",
 	                          LogicalType::LIST(LogicalType::VARCHAR), Value::LIST(LogicalType::VARCHAR, default_types));
+
+	// Register the events_session_name setting (default: empty string)
+	config.AddExtensionOption(EVENTS_SESSION_NAME_KEY,
+	                          "Optional name for this session, included in all events",
+	                          LogicalType::VARCHAR, Value(""));
 
 	// Register hooks for connection events (for new connections)
 	config.extension_callbacks.push_back(make_uniq<EventHooks>());
