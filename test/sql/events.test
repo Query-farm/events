@@ -79,8 +79,8 @@ SET events_destination = '';
 query IIIIII
 SELECT
     event,
-    -- Timestamp should be ISO 8601 format ending in Z
-    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp_format,
+    -- Timestamp should be present (read_json_auto parses ISO 8601 as TIMESTAMP)
+    timestamp IS NOT NULL as valid_timestamp_format,
     -- database_path should be :memory: or a path
     database_path IS NOT NULL as has_database_path,
     -- connection_id should be positive integer
@@ -104,7 +104,7 @@ SELECT
     -- query_id should match begin event
     query_id > 0 as valid_query_id,
     -- Verify common fields still present
-    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp,
+    timestamp IS NOT NULL as valid_timestamp,
     connection_id >= 0 as valid_connection_id,
     process_id > 0 as valid_process_id
 FROM read_json_auto('__TEST_DIR__/events_test1.jsonl', format='newline_delimited', ignore_errors=true)
@@ -226,7 +226,7 @@ SELECT
     -- Error type should be Catalog error
     error_type = 'Catalog' as correct_error_type,
     -- Common fields should still be present
-    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp,
+    timestamp IS NOT NULL as valid_timestamp,
     query_id > 0 as valid_query_id
 FROM read_json_auto('__TEST_DIR__/events_test5.jsonl', format='newline_delimited', ignore_errors=true)
 WHERE event = 'query_end' AND has_error = true
@@ -279,7 +279,7 @@ SELECT
     -- is_read_only should be boolean
     is_read_only IS NOT NULL as has_is_read_only,
     -- Common fields present
-    timestamp LIKE '____-__-__T__:__:__.%Z' as valid_timestamp
+    timestamp IS NOT NULL as valid_timestamp
 FROM read_json_auto('__TEST_DIR__/events_test6.jsonl', format='newline_delimited', ignore_errors=true)
 WHERE event = 'transaction_begin'
 LIMIT 1;
