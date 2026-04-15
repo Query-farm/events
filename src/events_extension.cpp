@@ -621,7 +621,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value(""));
 
 	// Register hooks for connection events (for new connections)
-	config.extension_callbacks.push_back(make_uniq<EventHooks>());
+	ExtensionCallback::Register(config, make_shared_ptr<EventHooks>());
 
 	// Also register hooks for existing connections (e.g., when loaded via LOAD or require in tests)
 	auto &connection_manager = db.GetConnectionManager();
