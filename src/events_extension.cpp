@@ -30,7 +30,7 @@
 
 #include "query_farm_telemetry.hpp"
 
-#define EVENTS_VERSION "2026011201"
+#define EVENTS_VERSION "2026072501"
 
 using namespace duckdb_yyjson; // NOLINT
 
