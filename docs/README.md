@@ -10,7 +10,7 @@
 # Events Extension for DuckDB
 
 [![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/events.html)
-[![build](https://github.com/Query-farm/events/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main)](https://github.com/Query-farm/events/actions/workflows/MainDistributionPipeline.yml?query=branch%3Amain)
+[![v1.5 build](https://github.com/Query-farm/events/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v1.5)](https://github.com/Query-farm/events/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av1.5)
 
 A DuckDB extension that hooks into database events and sends JSON-formatted notifications to external programs via stdin. Created by [Query.Farm](https://query.farm).
 
