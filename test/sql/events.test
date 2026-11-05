@@ -157,9 +157,9 @@ query IIII
 SELECT
     len(attached_databases) >= 2 as has_databases,
     -- Check that memory database is present
-    list_contains(list_transform(attached_databases, x -> x.name), 'memory') as has_memory_db,
+    list_contains(list_transform(attached_databases, lambda x: x.name), 'memory') as has_memory_db,
     -- Check that temp database is present
-    list_contains(list_transform(attached_databases, x -> x.name), 'temp') as has_temp_db,
+    list_contains(list_transform(attached_databases, lambda x: x.name), 'temp') as has_temp_db,
     -- Verify first database entry has all expected fields (name, path, type, read_only, temporary)
     attached_databases[1].name IS NOT NULL
     AND attached_databases[1].type IS NOT NULL

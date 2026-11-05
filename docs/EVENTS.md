@@ -335,7 +335,11 @@ Emitted when a prepared statement is finalized.
 
 ### execute_prepared
 
-Emitted when a prepared statement is executed (typically via C API).
+On DuckDB 2.0, emitted during binding of a SQL `EXECUTE` statement, after its
+parameters have been bound. DuckDB removed the old `OnExecutePrepared` callback;
+API executions that do not go through SQL `EXECUTE` still produce `query_begin`
+and `query_end`, but do not have a separate prepared-execution event. This event
+does not imply successful execution; check the corresponding `query_end`.
 
 **Additional Fields:**
 
@@ -365,7 +369,10 @@ Emitted when a prepared statement is executed (typically via C API).
 
 ### rebind_prepared_statement
 
-Emitted when a prepared statement is rebound with new parameters (e.g., via SQL `EXECUTE` statement).
+Emitted when DuckDB considers rebinding a SQL `EXECUTE` statement, including
+executions that can reuse the existing plan. On DuckDB 2.0 this shares the bind
+callback with `execute_prepared`; each enabled event is delivered once per
+callback, with the same query ID and parameter values.
 
 **Additional Fields:**
 
@@ -392,6 +399,32 @@ Emitted when a prepared statement is rebound with new parameters (e.g., via SQL 
 ```
 
 ---
+
+## Configuration and delivery behavior
+
+Settings are session-scoped by default. Use `SET GLOBAL` to establish defaults
+for other connections, including the destination and event types needed to
+observe `connection_opened`. The connection that loads the extension is already
+open; loading does not replay its opening event.
+
+Unknown event types and NULL entries in `events_types` are rejected. An empty
+list disables all events. `RESET events_types` restores the default query events.
+An empty or NULL destination disables delivery. Destinations require DuckDB's
+`enable_external_access` setting; turning it off also stops delivery to an
+already configured destination.
+
+On POSIX, destinations support single/double quoting, escaped characters, and
+empty quoted arguments. They run directly without a shell, so pipes, redirects,
+variable expansion, and globbing require explicitly invoking a shell. Windows
+uses `CreateProcess` command-line rules. Invalid POSIX quoting is rejected when
+the destination is set.
+
+Receiver startup failures, early exits, and pipe write failures are logged and
+do not change the query result. Synchronous delivery waits for the receiver to
+exit. Asynchronous delivery waits only for the payload to be written, so a
+receiver that does not read stdin can still block a large payload; completion
+order is not guaranteed. Receivers should read stdin promptly and impose their
+own timeouts for slow downstream work.
 
 ## Event Handler Example
 

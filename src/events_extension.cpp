@@ -2,7 +2,9 @@
 
 #include "events_extension.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
@@ -10,13 +12,20 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/logging/log_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <memory>
 #include <string>
 
 #include "events_logging.hpp"
@@ -25,22 +34,24 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #endif
 
 #include "query_farm_telemetry.hpp"
 
-#define EVENTS_VERSION "2026072501"
+#define EVENTS_VERSION "2026110501"
 
 using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 
 // Keys for storing settings in client config set_variables
-static const string EVENTS_DESTINATION_KEY = "events_destination";
-static const string EVENTS_ASYNC_KEY = "events_async";
-static const string EVENTS_TYPES_KEY = "events_types";
-static const string EVENTS_SESSION_NAME_KEY = "events_session_name";
+static const Identifier EVENTS_DESTINATION_KEY = "events_destination";
+static const Identifier EVENTS_ASYNC_KEY = "events_async";
+static const Identifier EVENTS_TYPES_KEY = "events_types";
+static const Identifier EVENTS_SESSION_NAME_KEY = "events_session_name";
 
 // Get the events destination from context
 static Value GetEventsDestination(ClientContext &context) {
@@ -81,7 +92,7 @@ static bool IsEventTypeEnabled(ClientContext &context, const string &event_type)
 	// Check if event_type is in the list
 	auto &list_children = ListValue::GetChildren(types_value);
 	for (auto &child : list_children) {
-		if (child.GetValue<string>() == event_type) {
+		if (!child.IsNull() && child.GetValue<string>() == event_type) {
 			return true;
 		}
 	}
@@ -94,7 +105,13 @@ static string GetCurrentTimestamp() {
 	auto time_t_now = std::chrono::system_clock::to_time_t(now);
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 	char buffer[32];
-	std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", std::gmtime(&time_t_now));
+	std::tm utc_time;
+#ifdef _WIN32
+	gmtime_s(&utc_time, &time_t_now);
+#else
+	gmtime_r(&time_t_now, &utc_time);
+#endif
+	std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &utc_time);
 	char ms_buffer[8];
 	snprintf(ms_buffer, sizeof(ms_buffer), ".%03d", static_cast<int>(ms.count()));
 	return string(buffer) + ms_buffer + "Z";
@@ -116,6 +133,7 @@ static vector<string> ParseCommandLine(const string &cmd) {
 	bool in_single_quote = false;
 	bool in_double_quote = false;
 	bool escaped = false;
+	bool token_started = false;
 
 	for (size_t i = 0; i < cmd.size(); i++) {
 		char c = cmd[i];
@@ -128,39 +146,121 @@ static vector<string> ParseCommandLine(const string &cmd) {
 
 		if (c == '\\' && !in_single_quote) {
 			escaped = true;
+			token_started = true;
 			continue;
 		}
 
 		if (c == '\'' && !in_double_quote) {
 			in_single_quote = !in_single_quote;
+			token_started = true;
 			continue;
 		}
 
 		if (c == '"' && !in_single_quote) {
 			in_double_quote = !in_double_quote;
+			token_started = true;
 			continue;
 		}
 
-		if (c == ' ' && !in_single_quote && !in_double_quote) {
-			if (!current.empty()) {
+		if (std::isspace(static_cast<unsigned char>(c)) && !in_single_quote && !in_double_quote) {
+			if (token_started) {
 				tokens.push_back(current);
 				current.clear();
+				token_started = false;
 			}
 			continue;
 		}
 
 		current += c;
+		token_started = true;
 	}
 
-	if (!current.empty()) {
+	if (escaped || in_single_quote || in_double_quote) {
+		throw InvalidInputException("events_destination contains an unfinished quote or escape");
+	}
+	if (token_started) {
 		tokens.push_back(current);
 	}
 
 	return tokens;
 }
 
+static void ValidateDestination(ClientContext &context, SetScope scope, Value &value) {
+	if (value.IsNull() || value.GetValue<string>().empty()) {
+		return;
+	}
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
+		throw PermissionException("events_destination requires enable_external_access=true");
+	}
+	auto destination = value.GetValue<string>();
+	if (destination.find('\0') != string::npos) {
+		throw InvalidInputException("events_destination cannot contain NUL bytes");
+	}
+#ifndef _WIN32
+	auto tokens = ParseCommandLine(destination);
+	if (tokens.empty() || tokens[0].empty()) {
+		throw InvalidInputException("events_destination must name an executable");
+	}
+#endif
+}
+
+static void ValidateEventTypes(ClientContext &context, SetScope scope, Value &value) {
+	if (value.IsNull()) {
+		return;
+	}
+	static const vector<string> supported = {
+	    "connection_opened",        "connection_closed",    "query_begin",    "query_end",        "transaction_begin",
+	    "transaction_commit",       "transaction_rollback", "planning_error", "finalize_prepare", "execute_prepared",
+	    "rebind_prepared_statement"};
+	for (auto &type : ListValue::GetChildren(value)) {
+		if (type.IsNull()) {
+			throw InvalidInputException("events_types cannot contain NULL entries");
+		}
+		auto name = type.GetValue<string>();
+		if (std::find(supported.begin(), supported.end(), name) == supported.end()) {
+			throw InvalidInputException("Unknown event type '%s' in events_types", name);
+		}
+	}
+}
+
+#ifndef _WIN32
+// A socket pair supplies stdin as a byte stream and lets us suppress SIGPIPE
+// per descriptor/send, without changing the embedding application's signals.
+static bool WriteEvent(int fd, const string &data) {
+#ifdef MSG_NOSIGNAL
+	constexpr int flags = MSG_NOSIGNAL;
+#else
+	constexpr int flags = 0; // SO_NOSIGPIPE is set on the socket below (macOS/BSD).
+#endif
+	size_t offset = 0;
+	while (offset < data.size()) {
+		auto count = send(fd, data.data() + offset, data.size() - offset, flags);
+		if (count < 0 && errno == EINTR) {
+			continue;
+		}
+		if (count <= 0) {
+			return false;
+		}
+		offset += static_cast<size_t>(count);
+	}
+	return true;
+}
+
+static int WaitForEventProcess(pid_t pid) {
+	int status;
+	pid_t result;
+	do {
+		result = waitpid(pid, &status, 0);
+	} while (result < 0 && errno == EINTR);
+	return result == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
 // Call external program with JSON input via stdin and log exit code
 static void CallEventsDestination(ClientContext &context, const string &event_type, const string &json_data) {
+	if (json_data.empty()) {
+		return;
+	}
 	// Check if this event type is enabled
 	if (!IsEventTypeEnabled(context, event_type)) {
 		return;
@@ -175,6 +275,7 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 		return; // Empty destination, silently skip
 	}
 	bool async_mode = GetEventsAsync(context);
+	string json_with_newline = json_data + "\n";
 
 #ifdef _WIN32
 	// Windows implementation using CreateProcess
@@ -189,7 +290,12 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 		return;
 	}
 
-	SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+	if (!SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0)) {
+		CloseHandle(stdin_read);
+		CloseHandle(stdin_write);
+		DUCKDB_LOG(context, EventsLogType, "Failed to configure events pipe", {});
+		return;
+	}
 
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
@@ -212,9 +318,17 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 	CloseHandle(stdin_read);
 
 	// Write JSON with trailing newline for JSONL format
-	string json_with_newline = json_data + "\n";
-	DWORD written;
-	WriteFile(stdin_write, json_with_newline.c_str(), json_with_newline.size(), &written, NULL);
+	size_t offset = 0;
+	while (offset < json_with_newline.size()) {
+		DWORD written = 0;
+		auto remaining = json_with_newline.size() - offset;
+		auto count = static_cast<DWORD>(remaining > MAXDWORD ? MAXDWORD : remaining);
+		if (!WriteFile(stdin_write, json_with_newline.data() + offset, count, &written, NULL) || written == 0) {
+			DUCKDB_LOG(context, EventsLogType, "Failed to write events destination", {{"destination", destination}});
+			break;
+		}
+		offset += written;
+	}
 	CloseHandle(stdin_write);
 
 	if (async_mode) {
@@ -227,7 +341,7 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 		// Sync mode: wait for process to complete
 		WaitForSingleObject(pi.hProcess, INFINITE);
 
-		DWORD exit_code;
+		DWORD exit_code = static_cast<DWORD>(-1);
 		GetExitCodeProcess(pi.hProcess, &exit_code);
 
 		DUCKDB_LOG(context, EventsLogType, "Events destination exited",
@@ -237,12 +351,39 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 		CloseHandle(pi.hThread);
 	}
 #else
+	// Prepare all C++ allocations before fork: another DuckDB thread may hold
+	// an allocator lock in the child, where only async-signal-safe calls are safe.
+	auto tokens = ParseCommandLine(destination);
+	if (tokens.empty() || tokens[0].empty()) {
+		return;
+	}
+	vector<char *> argv;
+	for (auto &token : tokens) {
+		argv.push_back(&token[0]);
+	}
+	argv.push_back(nullptr);
 	// POSIX implementation using fork/exec
 	int stdin_pipe[2];
-	if (pipe(stdin_pipe) == -1) {
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, stdin_pipe) == -1) {
 		DUCKDB_LOG(context, EventsLogType, "Failed to create pipe for events destination", {});
 		return;
 	}
+	if (fcntl(stdin_pipe[0], F_SETFD, FD_CLOEXEC) == -1 || fcntl(stdin_pipe[1], F_SETFD, FD_CLOEXEC) == -1) {
+		close(stdin_pipe[0]);
+		close(stdin_pipe[1]);
+		DUCKDB_LOG(context, EventsLogType, "Failed to configure events pipe", {});
+		return;
+	}
+
+#ifdef SO_NOSIGPIPE
+	int no_sigpipe = 1;
+	if (setsockopt(stdin_pipe[1], SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) == -1) {
+		close(stdin_pipe[0]);
+		close(stdin_pipe[1]);
+		DUCKDB_LOG(context, EventsLogType, "Failed to configure events pipe", {});
+		return;
+	}
+#endif
 
 	pid_t pid = fork();
 	if (pid == -1) {
@@ -269,21 +410,15 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 			// Grandchild continues to exec
 		}
 
-		dup2(stdin_pipe[0], STDIN_FILENO);
-		close(stdin_pipe[0]);
-
-		// Parse command line into arguments
-		auto tokens = ParseCommandLine(destination);
-		if (tokens.empty()) {
+		if (stdin_pipe[0] == STDIN_FILENO) {
+			if (fcntl(STDIN_FILENO, F_SETFD, 0) == -1) {
+				_exit(127);
+			}
+		} else if (dup2(stdin_pipe[0], STDIN_FILENO) == -1) {
 			_exit(127);
+		} else {
+			close(stdin_pipe[0]);
 		}
-
-		// Build argv array for execvp
-		vector<char *> argv;
-		for (auto &token : tokens) {
-			argv.push_back(const_cast<char *>(token.c_str()));
-		}
-		argv.push_back(nullptr);
 
 		execvp(argv[0], argv.data());
 		_exit(127); // exec failed
@@ -293,22 +428,19 @@ static void CallEventsDestination(ClientContext &context, const string &event_ty
 	close(stdin_pipe[0]); // Close read end
 
 	// Write JSON to child's stdin with trailing newline for JSONL format
-	string json_with_newline = json_data + "\n";
-	ssize_t bytes_written = write(stdin_pipe[1], json_with_newline.c_str(), json_with_newline.size());
-	(void)bytes_written; // Suppress unused warning
+	if (!WriteEvent(stdin_pipe[1], json_with_newline)) {
+		DUCKDB_LOG(context, EventsLogType, "Failed to write events destination", {{"destination", destination}});
+	}
 	close(stdin_pipe[1]); // Close to signal EOF
 
 	if (async_mode) {
 		// Wait for intermediate child (exits immediately after double-fork)
 		// Grandchild is adopted by init and won't become a zombie
-		waitpid(pid, nullptr, 0);
+		WaitForEventProcess(pid);
 		DUCKDB_LOG(context, EventsLogType, "Events destination started (async)", {{"destination", destination}});
 	} else {
 		// Sync mode: wait for child and get exit status
-		int status;
-		waitpid(pid, &status, 0);
-
-		int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+		int exit_code = WaitForEventProcess(pid);
 		DUCKDB_LOG(context, EventsLogType, "Events destination exited",
 		           {{"destination", destination}, {"exit_code", std::to_string(exit_code)}});
 	}
@@ -408,7 +540,20 @@ static void AddAttachedDatabases(yyjson_mut_doc *doc, yyjson_mut_val *root, Clie
 // Helper to build JSON for an event
 static string BuildEventJson(const char *event_type, ClientContext &context,
                              std::function<void(yyjson_mut_doc *, yyjson_mut_val *)> add_fields = nullptr) {
-	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+	// Avoid serializing or enumerating databases when this event has no receiver.
+	if (!Settings::Get<EnableExternalAccessSetting>(context) || !IsEventTypeEnabled(context, event_type)) {
+		return "";
+	}
+	auto destination = GetEventsDestination(context);
+	if (destination.IsNull() || destination.GetValue<string>().empty()) {
+		return "";
+	}
+	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> owner(yyjson_mut_doc_new(nullptr),
+	                                                                      yyjson_mut_doc_free);
+	auto doc = owner.get();
+	if (!doc) {
+		throw OutOfMemoryException("Failed to allocate event JSON");
+	}
 	yyjson_mut_val *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
 
@@ -419,15 +564,30 @@ static string BuildEventJson(const char *event_type, ClientContext &context,
 		add_fields(doc, root);
 	}
 
-	char *json_str = yyjson_mut_write(doc, 0, nullptr);
-	string result(json_str);
-	free(json_str);
-	yyjson_mut_doc_free(doc);
-
-	return result;
+	std::unique_ptr<char, decltype(&free)> json_str(yyjson_mut_write(doc, 0, nullptr), free);
+	if (!json_str) {
+		throw SerializationException("Failed to serialize event JSON");
+	}
+	return string(json_str.get());
 }
 
 class EventsHook : public ClientContextState {
+public:
+	explicit EventsHook(ClientContext &context) : context(context) {
+	}
+
+	bool CanRequestRebind() override {
+		// DuckDB only dispatches planning/finalize callbacks to states when at
+		// least one opts in. Our callbacks observe but never request a rebind.
+		auto destination = GetEventsDestination(context);
+		return !destination.IsNull() && !destination.GetValue<string>().empty() &&
+		       Settings::Get<EnableExternalAccessSetting>(context) &&
+		       (IsEventTypeEnabled(context, "planning_error") || IsEventTypeEnabled(context, "finalize_prepare"));
+	}
+
+private:
+	ClientContext &context;
+
 public:
 	// Query ID counter - incremented for each new query
 	uint64_t query_id_counter = 0;
@@ -449,18 +609,7 @@ public:
 	}
 
 	void QueryEnd(ClientContext &context) override {
-		uint64_t qid = current_query_id;
-		uint64_t txn_id = GetCurrentTransactionId(context);
-
-		string json =
-		    BuildEventJson("query_end", context, [qid, txn_id, &context](yyjson_mut_doc *doc, yyjson_mut_val *root) {
-			    yyjson_mut_obj_add_uint(doc, root, "query_id", qid);
-			    yyjson_mut_obj_add_uint(doc, root, "transaction_id", txn_id);
-			    yyjson_mut_obj_add_bool(doc, root, "has_error", false);
-			    AddAttachedDatabases(doc, root, context);
-		    });
-		CallEventsDestination(context, "query_end", json);
-		ClientContextState::QueryEnd(context);
+		QueryEnd(context, nullptr);
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
@@ -475,7 +624,6 @@ public:
 			                             AddAttachedDatabases(doc, root, context);
 		                             });
 		CallEventsDestination(context, "query_end", json);
-		ClientContextState::QueryEnd(context, error);
 	}
 
 	void TransactionBegin(MetaTransaction &transaction, ClientContext &context) override {
@@ -493,11 +641,7 @@ public:
 	}
 
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
-		string json = BuildEventJson("transaction_rollback", context, [&](yyjson_mut_doc *doc, yyjson_mut_val *root) {
-			AddTransactionInfo(doc, root, transaction);
-			yyjson_mut_obj_add_bool(doc, root, "has_error", false);
-		});
-		CallEventsDestination(context, "transaction_rollback", json);
+		TransactionRollback(transaction, context, nullptr);
 	}
 
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context,
@@ -507,7 +651,6 @@ public:
 			AddErrorInfo(doc, root, error);
 		});
 		CallEventsDestination(context, "transaction_rollback", json);
-		ClientContextState::TransactionRollback(transaction, context, error);
 	}
 
 	RebindQueryInfo OnPlanningError(ClientContext &context, SQLStatement &statement, ErrorData &error) override {
@@ -530,36 +673,26 @@ public:
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 
-	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
-	                                  RebindQueryInfo current_rebind) override {
+	void EmitPreparedEvent(const char *event_type, ClientContext &context, BindPreparedStatementCallbackInfo &info) {
 		uint64_t qid = current_query_id;
 		uint64_t txn_id = GetCurrentTransactionId(context);
 
-		string json = BuildEventJson("execute_prepared", context, [&](yyjson_mut_doc *doc, yyjson_mut_val *root) {
+		string json = BuildEventJson(event_type, context, [&](yyjson_mut_doc *doc, yyjson_mut_val *root) {
 			yyjson_mut_obj_add_uint(doc, root, "query_id", qid);
 			yyjson_mut_obj_add_uint(doc, root, "transaction_id", txn_id);
 			yyjson_mut_obj_add_strcpy(doc, root, "statement_type",
 			                          StatementTypeToString(info.prepared_statement.statement_type).c_str());
-			AddParameters(doc, root, info.parameters.parameters);
+			AddParameters(doc, root, info.parameters);
 		});
-		CallEventsDestination(context, "execute_prepared", json);
-		return RebindQueryInfo::DO_NOT_REBIND;
+		CallEventsDestination(context, event_type, json);
 	}
 
 	RebindQueryInfo OnRebindPreparedStatement(ClientContext &context, BindPreparedStatementCallbackInfo &info,
 	                                          RebindQueryInfo current_rebind) override {
-		uint64_t qid = current_query_id;
-		uint64_t txn_id = GetCurrentTransactionId(context);
-
-		string json =
-		    BuildEventJson("rebind_prepared_statement", context, [&](yyjson_mut_doc *doc, yyjson_mut_val *root) {
-			    yyjson_mut_obj_add_uint(doc, root, "query_id", qid);
-			    yyjson_mut_obj_add_uint(doc, root, "transaction_id", txn_id);
-			    yyjson_mut_obj_add_strcpy(doc, root, "statement_type",
-			                              StatementTypeToString(info.prepared_statement.statement_type).c_str());
-			    AddParameters(doc, root, info.parameters);
-		    });
-		CallEventsDestination(context, "rebind_prepared_statement", json);
+		// DuckDB 2.0 removed OnExecutePrepared. SQL EXECUTE dispatches this
+		// callback with bound parameters before executing the prepared statement.
+		EmitPreparedEvent("execute_prepared", context, info);
+		EmitPreparedEvent("rebind_prepared_statement", context, info);
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 };
@@ -568,7 +701,7 @@ public:
 static void RegisterEventsHookIfNeeded(ClientContext &context) {
 	auto &register_state = context.registered_state;
 	if (!register_state->Get<EventsHook>("events_hook_state")) {
-		auto state = make_shared_ptr<EventsHook>();
+		auto state = make_shared_ptr<EventsHook>(context);
 		register_state->Insert("events_hook_state", state);
 	}
 }
@@ -600,24 +733,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register the events_destination setting
 	config.AddExtensionOption(EVENTS_DESTINATION_KEY, "Path to the program that receives event notifications via stdin",
-	                          LogicalType::VARCHAR, Value());
+	                          LogicalType::VARCHAR, Value(), ValidateDestination);
 
 	// Register the events_async setting (default: false = synchronous)
-	config.AddExtensionOption(EVENTS_ASYNC_KEY,
-	                          "If true, events are delivered asynchronously (fire and forget). Default is false (synchronous).",
-	                          LogicalType::BOOLEAN, Value(false));
+	config.AddExtensionOption(
+	    EVENTS_ASYNC_KEY,
+	    "If true, events are delivered asynchronously (fire and forget). Default is false (synchronous).",
+	    LogicalType::BOOLEAN, Value(false));
 
 	// Register the events_types setting (default: query_begin and query_end)
 	vector<Value> default_types = {Value("query_begin"), Value("query_end")};
-	config.AddExtensionOption(EVENTS_TYPES_KEY,
-	                          "List of event types to send to the destination. Valid types: connection_opened, connection_closed, "
-	                          "query_begin, query_end, transaction_begin, transaction_commit, transaction_rollback, "
-	                          "planning_error, finalize_prepare, execute_prepared, rebind_prepared_statement",
-	                          LogicalType::LIST(LogicalType::VARCHAR), Value::LIST(LogicalType::VARCHAR, default_types));
+	config.AddExtensionOption(
+	    EVENTS_TYPES_KEY,
+	    "List of event types to send to the destination. Valid types: connection_opened, connection_closed, "
+	    "query_begin, query_end, transaction_begin, transaction_commit, transaction_rollback, "
+	    "planning_error, finalize_prepare, execute_prepared, rebind_prepared_statement",
+	    LogicalType::LIST(LogicalType::VARCHAR), Value::LIST(LogicalType::VARCHAR, default_types), ValidateEventTypes);
 
 	// Register the events_session_name setting (default: empty string)
-	config.AddExtensionOption(EVENTS_SESSION_NAME_KEY,
-	                          "Optional name for this session, included in all events",
+	config.AddExtensionOption(EVENTS_SESSION_NAME_KEY, "Optional name for this session, included in all events",
 	                          LogicalType::VARCHAR, Value(""));
 
 	// Register hooks for connection events (for new connections)

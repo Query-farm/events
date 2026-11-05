@@ -1,0 +1,46 @@
+# name: test/sql/events_connections.test
+# description: Connection callbacks and session-scoped settings
+# group: [events]
+
+require events
+
+require json
+
+statement ok
+SET GLOBAL events_types = ['connection_opened', 'connection_closed'];
+
+statement ok
+SET GLOBAL events_session_name = 'shared-default';
+
+statement ok
+SET GLOBAL events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/connections.jsonl';
+
+statement ok first
+SET SESSION events_session_name = 'first-session';
+
+query T second
+SELECT current_setting('events_session_name');
+----
+shared-default
+
+query T first
+SELECT current_setting('events_session_name');
+----
+first-session
+
+# Creating a replacement connection opens it and closes the previous one.
+reconnect
+
+statement ok
+SET GLOBAL events_destination = '';
+
+query TI
+SELECT event, count(*) FROM read_json_auto('__TEST_DIR__/connections.jsonl') GROUP BY event ORDER BY event;
+----
+connection_closed	1
+connection_opened	3
+
+query I
+SELECT count(DISTINCT connection_id) FROM read_json_auto('__TEST_DIR__/connections.jsonl') WHERE event = 'connection_opened';
+----
+3

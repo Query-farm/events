@@ -1,0 +1,90 @@
+# name: test/sql/events_callbacks.test
+# description: Planning, prepared statements and exactly-once completion callbacks
+# group: [events]
+
+require events
+
+require json
+
+statement ok
+SET events_types = ['query_begin', 'query_end', 'planning_error', 'finalize_prepare', 'execute_prepared', 'rebind_prepared_statement', 'transaction_rollback'];
+
+statement ok
+SET events_session_name = 'callbacks-雪';
+
+statement ok
+SET events_destination = 'python3 -c "import sys; open(sys.argv[1], ''a'').write(sys.stdin.read())" __TEST_DIR__/callbacks.jsonl';
+
+statement ok
+PREPARE event_statement AS SELECT $value::INTEGER;
+
+query I
+EXECUTE event_statement(value := 42);
+----
+42
+
+query I
+EXECUTE event_statement(value := 84);
+----
+84
+
+statement error
+SELECT * FROM events_missing_table;
+----
+Table with name events_missing_table does not exist
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT 123;
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET events_destination = '';
+
+# One completion per query, including failures (no success event after an error).
+query II
+SELECT count(*) > 0, count(*) = count(DISTINCT query_id)
+FROM read_json_auto('__TEST_DIR__/callbacks.jsonl') WHERE event = 'query_end';
+----
+true	true
+
+query III
+SELECT count(*), bool_and(error_type = 'Catalog'), bool_and(error_message LIKE '%events_missing_table%')
+FROM read_json_auto('__TEST_DIR__/callbacks.jsonl') WHERE event = 'query_end' AND has_error;
+----
+1	true	true
+
+query III
+SELECT count(*), bool_and(error_type = 'Catalog'), bool_and(error_message LIKE '%events_missing_table%')
+FROM read_json_auto('__TEST_DIR__/callbacks.jsonl') WHERE event = 'planning_error';
+----
+1	true	true
+
+query I
+SELECT count(*) > 0 FROM read_json_auto('__TEST_DIR__/callbacks.jsonl') WHERE event = 'finalize_prepare';
+----
+true
+
+query TIT
+SELECT event, count(*), string_agg(parameters.value, ',' ORDER BY query_id)
+FROM read_json_auto('__TEST_DIR__/callbacks.jsonl')
+WHERE event IN ('execute_prepared', 'rebind_prepared_statement') GROUP BY event ORDER BY event;
+----
+execute_prepared	2	42,84
+rebind_prepared_statement	2	42,84
+
+# An implicit rollback for the planning error and one explicit rollback.
+query II
+SELECT count(*), count(DISTINCT transaction_id)
+FROM read_json_auto('__TEST_DIR__/callbacks.jsonl') WHERE event = 'transaction_rollback';
+----
+2	2
+
+query I
+SELECT bool_and(session_name = 'callbacks-雪') FROM read_json_auto('__TEST_DIR__/callbacks.jsonl');
+----
+true

@@ -1,0 +1,57 @@
+# name: test/sql/events_settings.test
+# description: Validate event settings and reset behavior
+# group: [events]
+
+require events
+
+query T
+SELECT current_setting('events_session_name');
+----
+(empty)
+
+statement ok
+SET events_session_name = 'session-雪';
+
+query T
+SELECT current_setting('EVENTS_SESSION_NAME');
+----
+session-雪
+
+statement ok
+RESET events_session_name;
+
+query T
+SELECT current_setting('events_session_name');
+----
+(empty)
+
+statement error
+SET events_types = ['query_begn'];
+----
+Unknown event type 'query_begn' in events_types
+
+statement error
+SET events_types = ['query_begin', NULL];
+----
+events_types cannot contain NULL entries
+
+statement ok
+SET events_types = [];
+
+query I
+SELECT len(current_setting('events_types'));
+----
+0
+
+statement ok
+RESET events_types;
+
+query T
+SELECT current_setting('events_types');
+----
+[query_begin, query_end]
+
+statement error
+SET events_destination = concat('python3', chr(0), 'ignored');
+----
+events_destination cannot contain NUL bytes

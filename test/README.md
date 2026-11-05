@@ -1,11 +1,25 @@
 # Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the events extension, this should probably be the goal too.
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
-```bash
-make test
+Build with `GEN=ninja make release`, then run:
+
+```sh
+QUERY_FARM_TELEMETRY_OPT_OUT=1 make test
 ```
-or
-```bash
-make test_debug
+
+The test target runs the Python CLI integration suite and all SQLLogicTests in
+`sql/`. `make test_debug` tests a debug build. Both suites require Python 3 on
+`PATH`; neither needs third-party Python packages.
+
+The SQL tests cover settings, filtering, query/transaction/connection callbacks,
+planning errors, prepared parameters, and session isolation. The integration
+suite loads the binary extension and additionally checks large Unicode payloads,
+command quoting, early receiver exits, missing executables, asynchronous
+delivery, and external-access restrictions.
+
+Run integration tests separately with:
+
+```sh
+python3 test/scripts/test_events.py --duckdb build/release/duckdb -v
 ```
+
+CI runs these same Makefile targets for both fresh builds and restored artifacts.
